@@ -25,6 +25,10 @@ WORKDIR /home/frontend/apps/drive
 EXPOSE 3000
 
 RUN yarn build-theme
+
+ARG DOCKER_USER
+USER ${DOCKER_USER}
+
 CMD ["yarn", "dev"]
 
 # Tilt will rebuild drive target so, we dissociate drive and drive-builder 

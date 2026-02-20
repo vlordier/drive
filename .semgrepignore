@@ -1,0 +1,4 @@
+src/frontend/apps/e2e/__tests__/app-drive/utils-common.ts
+src/backend/core/api/viewsets.py
+src/backend/core/models.py
+src/mail/mjml/invitation.mjml

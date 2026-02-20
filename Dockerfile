@@ -92,10 +92,8 @@ RUN apk add \
   pango \
   shared-mime-info
 
-COPY ./docker/files/etc/mime.types /etc/mime.types.partial
-RUN wget https://raw.githubusercontent.com/suitenumerique/django-lasuite/refs/heads/main/assets/conf/mime.types -O /etc/mime.types && \
-  cat /etc/mime.types.partial >> /etc/mime.types && \
-  rm /etc/mime.types.partial
+# Security: Vendored mime.types instead of downloading from remote (supply chain hardening)
+COPY ./docker/files/etc/mime.types /etc/mime.types
 
 # Copy entrypoint
 COPY ./docker/files/usr/local/bin/entrypoint /usr/local/bin/entrypoint
@@ -120,6 +118,10 @@ RUN DJANGO_CONFIGURATION=Build \
 # We wrap commands run in this container by the following entrypoint that
 # creates a user on-the-fly with the container user ID (see USER) and root group
 # ID.
+
+# Run as non-root user for security
+USER default
+
 ENTRYPOINT [ "/usr/local/bin/entrypoint" ]
 
 # ---- Development image ----

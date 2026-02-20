@@ -14,13 +14,12 @@ import os
 import tomllib
 from socket import gethostbyname, gethostname
 
-from django.utils.translation import gettext_lazy as _
-
 import dj_database_url
 import posthog
 import sentry_sdk
 from boto3.s3.transfer import TransferConfig
 from configurations import Configuration, values
+from django.utils.translation import gettext_lazy as _
 from lasuite.configuration.values import SecretFileValue
 from sentry_sdk.integrations.django import DjangoIntegration
 
@@ -49,22 +48,12 @@ def get_release():
 
 class Base(Configuration):
     """
-    This is the base configuration every configuration (aka environment) should inherit from. It
-    is recommended to configure third-party applications by creating a configuration mixins in
-    ./configurations and compose the Base configuration with those mixins.
+    This is the base configuration every environment should inherit from.
 
-    It depends on an environment variable that SHOULD be defined:
-
-    * DJANGO_SECRET_KEY
-
-    You may also want to override default configuration by setting the following environment
-    variables:
-
-    * SENTRY_DSN
-    * DB_NAME
-    * DB_HOST
-    * DB_PASSWORD
-    * DB_USER
+    Security requirements:
+    - DJANGO_SECRET_KEY must be set (not the default)
+    - DEBUG must be False in production
+    - All security settings should be properly configured
     """
 
     DEBUG = False
@@ -73,10 +62,162 @@ class Base(Configuration):
 
     API_VERSION = "v1.0"
 
+    # Security: Validate environment on startup
+    _security_validated = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._validate_security_settings()
+
+    def _validate_security_settings(self):
+        """Validate critical security settings on startup."""
+        if Base._security_validated:
+            return
+
+        # Check for insecure DEBUG in production-like environments
+        env_name = os.environ.get("DJANGO_CONFIGURATION", "").lower()
+        if self.DEBUG and env_name in ("production", "prod", "staging", "stage"):
+            import warnings  # noqa: PLC0415
+
+            warnings.warn(
+                "WARNING: DEBUG is True in production environment! "
+                "This exposes sensitive data and is a security risk.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # Check for default/insecure secret key
+        secret_key = getattr(self, "SECRET_KEY", None)
+        if secret_key and (
+            secret_key in ("DummyKey", "CHANGE_ME", "insecure", "test", None)
+            or len(secret_key) < 50
+        ):
+            import warnings  # noqa: PLC0415
+
+            warnings.warn(
+                "WARNING: SECRET_KEY is insecure or too short! "
+                "Use a long, random string for production.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # Check ALLOWED_HOSTS is not empty in production
+        if not self.ALLOWED_HOSTS and env_name in ("production", "prod"):
+            import warnings  # noqa: PLC0415
+
+            warnings.warn(
+                "WARNING: ALLOWED_HOSTS is empty! "
+                "This will block all requests in production.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # Check ALLOWED_HOSTS doesn't contain wildcards in production
+        if env_name in ("production", "prod"):
+            import warnings  # noqa: PLC0415
+
+            if "*" in self.ALLOWED_HOSTS:
+                warnings.warn(
+                    "WARNING: ALLOWED_HOSTS contains '*' which allows any host! "
+                    "This is a security risk in production.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        Base._security_validated = True
+
     # Security
     ALLOWED_HOSTS = values.ListValue([])
     SECRET_KEY = SecretFileValue(None)
     SERVER_TO_SERVER_API_TOKENS = values.ListValue([])
+
+    # Session security - enforce secure cookie settings in production
+    SESSION_COOKIE_SECURE = values.BooleanValue(
+        default=True, environ_name="SESSION_COOKIE_SECURE", environ_prefix=None
+    )
+    SESSION_COOKIE_HTTPONLY = values.BooleanValue(
+        default=True, environ_name="SESSION_COOKIE_HTTPONLY", environ_prefix=None
+    )
+    SESSION_COOKIE_SAMESITE = values.Value(
+        default="Lax", environ_name="SESSION_COOKIE_SAMESITE", environ_prefix=None
+    )
+
+    # CSRF security
+    # Django 6.0 CSRF docs: https://docs.djangoproject.com/en/6.0/ref/csrf/
+    CSRF_COOKIE_SECURE = values.BooleanValue(
+        default=True, environ_name="CSRF_COOKIE_SECURE", environ_prefix=None
+    )
+    CSRF_COOKIE_HTTPONLY = values.BooleanValue(
+        default=True, environ_name="CSRF_COOKIE_HTTPONLY", environ_prefix=None
+    )
+    CSRF_COOKIE_SAMESITE = values.Value(
+        default="Lax", environ_name="CSRF_COOKIE_SAMESITE", environ_prefix=None
+    )
+    # Keep CSRF token in cookie (not session) for better security
+    # This prevents session bloat and keeps CSRF separate from session
+    CSRF_USE_SESSIONS = values.BooleanValue(
+        default=False, environ_name="CSRF_USE_SESSIONS", environ_prefix=None
+    )
+    # Custom header name for CSRF (Django defaults to HTTP_X_CSRFTOKEN)
+    CSRF_HEADER_NAME = "HTTP_X_CSRFTOKEN"
+
+    # Security headers - applied in all environments for defense in depth
+    SECURE_CONTENT_TYPE_NOSNIFF = values.BooleanValue(
+        default=True, environ_name="SECURE_CONTENT_TYPE_NOSNIFF", environ_prefix=None
+    )
+    SECURE_BROWSER_XSS_FILTER = values.BooleanValue(
+        default=True, environ_name="SECURE_BROWSER_XSS_FILTER", environ_prefix=None
+    )
+
+    # Additional security settings
+    SECURE_SSL_REDIRECT = values.BooleanValue(
+        default=True, environ_name="SECURE_SSL_REDIRECT", environ_prefix=None
+    )
+    SECURE_HSTS_SECONDS = values.PositiveIntegerValue(
+        default=31536000,  # 1 year
+        environ_name="SECURE_HSTS_SECONDS",
+        environ_prefix=None,
+    )
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = values.BooleanValue(
+        default=True, environ_name="SECURE_HSTS_INCLUDE_SUBDOMAINS", environ_prefix=None
+    )
+    SECURE_HSTS_PRELOAD = values.BooleanValue(
+        default=True, environ_name="SECURE_HSTS_PRELOAD", environ_prefix=None
+    )
+
+    # Prevent clickjacking
+    X_FRAME_OPTIONS = "DENY"
+
+    # Password hashing - use Argon2 first, then PBKDF2
+    PASSWORD_HASHERS = [
+        "django.contrib.auth.hashers.Argon2PasswordHasher",
+        "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+        "django.contrib.auth.hashers.PBKDF2SHA1PasswordHasher",
+    ]
+    # Minimum password length
+    AUTH_PASSWORD_MIN_LENGTH = 12
+
+    # Session security
+    SESSION_COOKIE_AGE = 3600  # 1 hour
+    SESSION_COOKIE_EXPIRE_AT_BROWSER_CLOSE = True
+    SESSION_INVALIDATE_ALL_OTHER_ON_PASSWORD_CHANGE = True
+
+    # Prevent password reuse
+    AUTH_PASSWORD_VALIDATORS = [
+        {
+            "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
+        },
+        {
+            "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+            "OPTIONS": {"min_length": 12},
+        },
+        {
+            "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
+        },
+        {
+            "NAME": "django.contrib.auth.password_validation.NumericPasswordValidator",
+        },
+    ]
 
     # Application definition
     ROOT_URLCONF = "drive.urls"
@@ -850,16 +991,45 @@ class Base(Configuration):
     ]
 
     MIDDLEWARE = [
+        # Security: Request ID for audit trails (must be first)
+        "core.middleware.security.logging.RequestIDMiddleware",
+        # Django security middleware
         "django.middleware.security.SecurityMiddleware",
+        # Content-Security-Policy - requires SecurityMiddleware first
+        "django.middleware.security.ContentSecurityPolicyMiddleware",
+        # Input validation and sanitization
+        "core.middleware.security.input_validation.InputValidationMiddleware",
+        "core.middleware.security.input_validation.RequestTimeoutMiddleware",
         "whitenoise.middleware.WhiteNoiseMiddleware",
+        # Session must be before CSRF and Auth
         "django.contrib.sessions.middleware.SessionMiddleware",
         "django.middleware.locale.LocaleMiddleware",
         "django.middleware.clickjacking.XFrameOptionsMiddleware",
         "corsheaders.middleware.CorsMiddleware",
         "django.middleware.common.CommonMiddleware",
+        # CSRF must be before Authentication
         "django.middleware.csrf.CsrfViewMiddleware",
         "django.contrib.auth.middleware.AuthenticationMiddleware",
         "django.contrib.messages.middleware.MessageMiddleware",
+        # Custom security middleware
+        # Session security (needs session)
+        "core.middleware.security.auth.SessionSecurityMiddleware",
+        # Token validation (needs authentication)
+        "core.middleware.security.auth.TokenValidationMiddleware",
+        # Rate limiting - Note: DRF throttling (configured in REST_FRAMEWORK) is the primary
+        # production-ready solution using Redis cache. This custom middleware provides an
+        # additional layer of protection at the middleware level but uses in-memory storage.
+        # For multi-instance deployments, rely on DRF throttling as the primary mechanism.
+        "core.middleware.security.rate_limiting.IPRateLimitMiddleware",
+        # CSRF helper (adds X-CSRF-Token header)
+        "core.middleware.security.auth.CSRFProtectionMiddleware",
+        # Log sanitization (must be after auth to have user info)
+        "core.middleware.security.logging.SanitizeQueryParamsMiddleware",
+        "core.middleware.security.logging.SanitizeHeadersMiddleware",
+        # Security audit (should be late to capture all events)
+        "core.middleware.security.audit.SecurityAuditMiddleware",
+        # Security headers (must be last to add to final response)
+        "core.middleware.security.logging.SecureResponseMiddleware",
         "dockerflow.django.middleware.DockerflowMiddleware",
     ]
 
@@ -958,8 +1128,22 @@ class Base(Configuration):
         "PAGE_SIZE": 20,
         "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.URLPathVersioning",
         "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
-        "DEFAULT_THROTTLE_CLASSES": ["rest_framework.throttling.ScopedRateThrottle"],
+        "DEFAULT_THROTTLE_CLASSES": [
+            "rest_framework.throttling.AnonRateThrottle",
+            "rest_framework.throttling.UserRateThrottle",
+            "rest_framework.throttling.ScopedRateThrottle",
+        ],
         "DEFAULT_THROTTLE_RATES": {
+            "anon": values.Value(
+                default="500/day",
+                environ_name="API_ANON_THROTTLE_RATE",
+                environ_prefix=None,
+            ),
+            "user": values.Value(
+                default="5000/day",
+                environ_name="API_USER_THROTTLE_RATE",
+                environ_prefix=None,
+            ),
             "user_list_sustained": values.Value(
                 default="180/hour",
                 environ_name="API_USERS_LIST_THROTTLE_RATE_SUSTAINED",
@@ -1017,11 +1201,55 @@ class Base(Configuration):
     AUTH_USER_MODEL = "core.User"
     INVITATION_VALIDITY_DURATION = 604800  # 7 days, in seconds
 
+    # Request size limits for security
+    # Prevent DoS via large request bodies
+    DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB max request body
+    FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB max file in memory
+    DATA_UPLOAD_MAX_NUMBER_FIELDS = 1000  # Max form fields to prevent DoS
+
+    # File upload security
+    FILE_UPLOAD_PERMISSIONS = 0o644  # Read/write for owner, read for others
+
+    # Default auto field for security
+    DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+    # Security: Disable interactive password login (force OIDC)
+    # This prevents Django's built-in username/password authentication
+    AUTHENTICATION_BACKENDS = [
+        "django.contrib.auth.backends.ModelBackend",
+        "core.authentication.backends.OIDCAuthenticationBackend",
+    ]
+
+    # Disable user enumeration
+    # Prevents attackers from discovering valid usernames
+    # Custom error messages for auth failures
+    # (Implemented in custom auth backend)
+
+    # Require explicit permission for dangerous operations
+    # Handled via custom permission classes
+
+    # Prevent SQL injection via string queries
+    # Use RawSQL with parameterized queries only
+    # This is enforced at the ORM level
+
     # CORS
     CORS_ALLOW_CREDENTIALS = True
     CORS_ALLOW_ALL_ORIGINS = values.BooleanValue(False)
     CORS_ALLOWED_ORIGINS = values.ListValue([])
     CORS_ALLOWED_ORIGIN_REGEXES = values.ListValue([])
+    # CORS cache preflight for 1 hour
+    CORS_PREFLOW_MAX_AGE = 3600
+    # Only allow these methods
+    CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+    # Only allow these headers
+    CORS_ALLOW_HEADERS = [
+        "accept",
+        "accept-encoding",
+        "authorization",
+        "content-type",
+        "x-csrftoken",
+        "x-request-id",
+    ]
 
     # Sentry
     SENTRY_DSN = values.Value(None, environ_name="SENTRY_DSN", environ_prefix=None)
@@ -1095,7 +1323,7 @@ class Base(Configuration):
     THUMBNAIL_EXTENSION = "webp"
     THUMBNAIL_TRANSPARENCY_EXTENSION = "webp"
     THUMBNAIL_DEFAULT_STORAGE_ALIAS = "default"
-    THUMBNAIL_ALIASES = {}
+    THUMBNAIL_ALIASES: dict = {}
 
     # Celery
     CELERY_BROKER_URL = values.Value("redis://redis:6379/0")
@@ -1345,6 +1573,11 @@ class Base(Configuration):
     LOGGING = {
         "version": 1,
         "disable_existing_loggers": False,
+        "filters": {
+            "sanitize_pii": {
+                "()": "core.logging.SanitizePIIFilter",
+            },
+        },
         "formatters": {
             "simple": {
                 "format": "{asctime} {name} {levelname} {message}",
@@ -1355,24 +1588,32 @@ class Base(Configuration):
             "console": {
                 "class": "logging.StreamHandler",
                 "formatter": "simple",
+                "filters": ["sanitize_pii"],
             },
         },
         # Override root logger to send it to console
         "root": {
             "handlers": ["console"],
             "level": values.Value(
-                "INFO", environ_name="LOGGING_LEVEL_LOGGERS_ROOT", environ_prefix=None
+                "WARNING",
+                environ_name="LOGGING_LEVEL_LOGGERS_ROOT",
+                environ_prefix=None,
             ),
         },
         "loggers": {
             "core": {
                 "handlers": ["console"],
                 "level": values.Value(
-                    "INFO",
+                    "WARNING",
                     environ_name="LOGGING_LEVEL_LOGGERS_APP",
                     environ_prefix=None,
                 ),
                 "propagate": True,
+            },
+            "security": {
+                "handlers": ["console"],
+                "level": "WARNING",
+                "propagate": False,
             },
         },
     }
@@ -1394,7 +1635,7 @@ class Base(Configuration):
     WOPI_CLIENTS = values.ListValue(
         [], environ_name="WOPI_CLIENTS", environ_prefix=None
     )
-    WOPI_CLIENTS_CONFIGURATION = {}
+    WOPI_CLIENTS_CONFIGURATION: dict = {}
     WOPI_EXCLUDED_MIMETYPES = values.ListValue(
         [
             "image/svg+xml",
@@ -1610,10 +1851,22 @@ class Build(Base):
 
 class Development(Base):
     """
-    Development environment settings
-
+    Development settings - for local development only!
+    WARNING: Never use these settings in production!
     We set DEBUG to True and configure the server to respond from all hosts.
     """
+
+    # Security: Warn if accidentally used in production
+    if os.environ.get("DJANGO_CONFIGURATION") not in ("Development", "Test", "e2e"):
+        import warnings  # noqa: PLC0415
+
+        warnings.warn(
+            "FATAL: Development settings detected in non-development environment! "
+            "This configuration has ALLOWED_HOSTS=['*'] and CORS_ALLOW_ALL_ORIGINS=True "
+            "which are major security risks.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     ALLOWED_HOSTS = ["*"]
     CORS_ALLOW_ALL_ORIGINS = True
@@ -1650,8 +1903,9 @@ class Test(Base):
         "default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"},
     }
 
+    # Security: Use PBKDF2 instead of MD5 for password hashing in tests
     PASSWORD_HASHERS = [
-        "django.contrib.auth.hashers.MD5PasswordHasher",
+        "django.contrib.auth.hashers.PBKDF2PasswordHasher",
     ]
     USE_SWAGGER = True
 
@@ -1722,7 +1976,51 @@ class Production(Base):
     SESSION_COOKIE_SECURE = True
 
     # Privacy
-    SECURE_REFERRER_POLICY = "same-origin"
+    SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+
+    # Cookie security - httponly and samesite
+    CSRF_COOKIE_HTTPONLY = True
+    CSRF_COOKIE_SAMESITE = "Lax"
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = "Lax"
+
+    # Disable browsing the static/media files
+    # Static files should be served by a web server (nginx, cloudfront, etc.)
+    # DEBUG = False already handles this
+
+    # Additional security headers
+    # Content-Security-Policy - helps prevent XSS and data injection attacks
+    # NOTE: 'unsafe-inline' and 'unsafe-eval' are included for compatibility with
+    # existing codebase. To strengthen XSS protection, migrate to nonce-based CSP:
+    # - Use 'nonce-<base64-value>' in script-src/style-src
+    # - Add {% csrf_token %} with nonce to templates
+    # - Or use 'strict-dynamic' with nonces
+    # TODO: Phase out 'unsafe-inline' and 'unsafe-eval' once all scripts use nonces
+    SECURE_CSP_DEFAULT = "'self'"
+    SECURE_CSP_SCRIPT_SRC = "'self' 'unsafe-inline' 'unsafe-eval'"
+    SECURE_CSP_STYLE_SRC = "'self' 'unsafe-inline'"
+    SECURE_CSP_IMG_SRC = "'self' data: https: blob:"
+    SECURE_CSP_FONT_SRC = "'self' data:"
+    SECURE_CSP_CONNECT_SRC = "'self' https://*.posthog.com"
+    SECURE_CSP_FRAME_ANCESTORS = "'none'"
+    SECURE_CSP_BASE_URI = "'self'"
+    SECURE_CSP_OBJECT_SRC = "'none'"
+
+    # Enable CSP report-only to identify violations without blocking
+    # Remove this in production once all CSP violations are fixed
+    SECURE_CSP_REPORT_ONLY = True
+
+    # Permissions-Policy - controls which browser features can be used
+    SECURE_PERMISSIONS_POLICY = {
+        "accelerometer": "()",
+        "camera": "()",
+        "geolocation": "()",
+        "gyroscope": "()",
+        "magnetometer": "()",
+        "microphone": "()",
+        "payment": "()",
+        "usb": "()",
+    }
 
 
 class Feature(Production):

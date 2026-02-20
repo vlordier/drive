@@ -7,6 +7,17 @@ on:
   pull_request:
     branches:
       - "*"
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL for ZAP scan (e.g., https://staging.example.com)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
 
 jobs:
   lint-git:
@@ -14,7 +25,7 @@ jobs:
     if: github.event_name == 'pull_request' # Makes sense only for pull requests
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@b4ffde65f46336abcc1843dd5c3f5f8e2c90dae4
         with:
           fetch-depth: 0
       - name: show
@@ -33,6 +44,23 @@ jobs:
       - name: Lint commit messages added to main
         if: always()
         run: ~/.local/bin/gitlint --commits origin/${{ github.event.pull_request.base.ref }}..HEAD
+      - name: Scan for secrets
+        uses: trufflesecurity/trufflehog@e7ff8cd18e367b48c0ad7ed9e8666d055c0e3edf
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base_ref }}
+          head: HEAD
+          extra_args: --filter-entropy --no-update
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@6e0430d1cfc95ed278f0cc3b5e5e3fc5e32a8f80
+        with:
+          scanpath: "bin/"
+          severity: "error"
+      - name: Run ShellCheck on helm scripts
+        uses: ludeeus/action-shellcheck@6e0430d1cfc95ed278f0cc3b5e5e3fc5e32a8f80
+        with:
+          scanpath: "src/helm/drive/"
+          severity: "error"
 
   check-changelog:
     runs-on: ubuntu-latest
@@ -41,7 +69,7 @@ jobs:
       github.event_name == 'pull_request'
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@b4ffde65f46336abcc1843dd5c3f5f8e2c90dae4
         with:
           fetch-depth: 50
       - name: Check that the CHANGELOG has been modified in the current branch
@@ -51,7 +79,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@b4ffde65f46336abcc1843dd5c3f5f8e2c90dae4
       - name: Check CHANGELOG max line length
         run: |
           max_line_length=$(cat CHANGELOG.md | grep -Ev "^\[.*\]: https://github.com" | wc -L)
@@ -70,13 +98,13 @@ jobs:
         working-directory: src/backend
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@b4ffde65f46336abcc1843dd5c3f5f8e2c90dae4
       - name: "Set up Python"
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
         with:
           python-version-file: "src/backend/pyproject.toml"
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@5a8a1669a6e4e9f0a5ab86ff4f2e9bd2d6c61e7e
       - name: Install the project
         run: uv sync --locked --all-extras
 
@@ -127,7 +155,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@b4ffde65f46336abcc1843dd5c3f5f8e2c90dae4
 
       - name: Create writable /data
         run: |
@@ -135,7 +163,7 @@ jobs:
           sudo mkdir -p /data/static
 
       - name: Restore the mail templates
-        uses: actions/cache@v4
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57
         id: mail-templates
         with:
           path: "src/backend/core/templates/mail"
@@ -170,11 +198,11 @@ jobs:
             mc version enable drive/drive-media-storage"
 
       - name: "Set up Python"
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
         with:
           python-version-file: "src/backend/pyproject.toml"
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@5a8a1669a6e4e9f0a5ab86ff4f2e9bd2d6c61e7e
       - name: Install the dependencies
         run: uv sync --locked --all-extras
 
@@ -189,3 +217,148 @@ jobs:
 
       - name: Run tests
         run: uv run pytest -n 2
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build-mails
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336abcc1843dd5c3f5f8e2c90dae4
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
+        with:
+          python-version-file: "src/backend/pyproject.toml"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@5a8a1669a6e4e9f0a5ab86ff4f2e9bd2d6c61e7e
+
+      - name: Install dependencies
+        run: uv sync --locked --all-extras
+
+      - name: Run Bandit security scan
+        run: uv run bandit -r core/ -x B101,B105,B106,B608 -f json -o bandit-report.json || true
+        continue-on-error: true
+
+      - name: Run pip-audit for dependency vulnerabilities
+        run: uv run pip-audit --format=json -o pip-audit-report.json || true
+        continue-on-error: true
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            pip-audit-report.json
+          retention-days: 7
+
+  codeql:
+    runs-on: ubuntu-latest
+    needs: lint-back
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336abcc1843dd5c3f5f8e2c90dae4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@4e7c5b0398166b4b2c0aa8443a7e5c1f0ecb94f3
+        with:
+          languages: python, javascript, typescript
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@4e7c5b0398166b4b2c0aa8443a7e5c1f0ecb94f3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@4e7c5b0398166b4b2c0aa8443a7e5c1f0ecb94f3
+        with:
+          category: "/language:python,javascript,typescript"
+
+  container-scan:
+    runs-on: ubuntu-latest
+    needs: lint-back
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336abcc1843dd5c3f5f8e2c90dae4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b76c4fb6d5c4f5d31b6e6a7c8a0e9b7c4d
+
+      - name: Build Docker image
+        uses: docker/build-push-action@59c4e8621c2d68f4f1e1a1a5e7d5e8f0a2b3c4d5
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: drive:latest
+          cache-from: type=gha
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@be41c9c7d2e1e56f7b18b00d3b3c9c9e74c4f7d3
+        with:
+          image-ref: 'drive:latest'
+          format: 'json'
+          output: 'trivy-report.json'
+          severity: 'CRITICAL,HIGH'
+        continue-on-error: true
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: trivy-report
+          path: trivy-report.json
+          retention-days: 7
+
+  zap-api-scan:
+    runs-on: ubuntu-latest
+    # Run manually via workflow_dispatch
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336abcc1843dd5c3f5f8e2c90dae4
+
+      - name: OWASP ZAP API Scan
+        uses: zaproxy/action-api-scan@v0.8.0
+        with:
+          target: ${{ github.event.inputs.target_url || 'https://your-staging-url.com/api/' }}
+          format: json
+          output: zap-api-report.json
+        continue-on-error: true
+
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: zap-api-report
+          path: zap-api-report.json
+          retention-days: 7
+
+  zap-baseline-scan:
+    runs-on: ubuntu-latest
+    # Run manually via workflow_dispatch
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336abcc1843dd5c3f5f8e2c90dae4
+
+      - name: OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.9.0
+        with:
+          target: ${{ github.event.inputs.target_url || 'https://your-staging-url.com' }}
+          format: json
+          output: zap-baseline-report.json
+        continue-on-error: true
+
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: zap-baseline-report
+          path: zap-baseline-report.json
+          retention-days: 7
