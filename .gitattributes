@@ -1,0 +1,13 @@
+* text=auto eol=lf
+*.py text
+*.ts text
+*.tsx text
+*.js text
+*.json text
+*.yaml text
+*.yml text
+*.toml text
+*.html text
+*.css text
+*.sh text
+*.tf text
